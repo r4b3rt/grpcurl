@@ -7,5 +7,5 @@ require (
 	github.com/golang/protobuf v1.5.2
 	github.com/jhump/protoreflect v1.14.1
 	google.golang.org/grpc v1.52.3
-	google.golang.org/protobuf v1.28.1
+	google.golang.org/protobuf v1.30.0
 )
