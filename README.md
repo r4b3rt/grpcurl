@@ -1,6 +1,7 @@
 # gRPCurl
 [![Build Status](https://circleci.com/gh/fullstorydev/grpcurl/tree/master.svg?style=svg)](https://circleci.com/gh/fullstorydev/grpcurl/tree/master)
 [![Go Report Card](https://goreportcard.com/badge/github.com/fullstorydev/grpcurl)](https://goreportcard.com/report/github.com/fullstorydev/grpcurl)
+[![Snap Release Status](https://snapcraft.io/grpcurl/badge.svg)](https://snapcraft.io/grpcurl)
 
 `grpcurl` is a command-line tool that lets you interact with gRPC servers. It's
 basically `curl` for gRPC servers.
@@ -14,7 +15,7 @@ This program accepts messages using JSON encoding, which is much more friendly f
 humans and scripts.
 
 With this tool you can also browse the schema for gRPC services, either by querying
-a server that supports [server reflection](https://github.com/grpc/grpc/blob/master/src/proto/grpc/reflection/v1alpha/reflection.proto),
+a server that supports [server reflection](https://github.com/grpc/grpc/blob/master/src/proto/grpc/reflection/v1/reflection.proto),
 by reading proto source files, or by loading in compiled "protoset" files (files that contain
 encoded file [descriptor protos](https://github.com/google/protobuf/blob/master/src/google/protobuf/descriptor.proto)).
 In fact, the way the tool transforms JSON request data into a binary encoded protobuf
@@ -61,9 +62,9 @@ brew install grpcurl
 For platforms that support Docker, you can download an image that lets you run `grpcurl`:
 ```shell
 # Download image
-docker pull fullstorydev/grpcurl:latest
+docker pull ghcr.io/fullstorydev/grpcurl:latest
 # Run the tool
-docker run fullstorydev/grpcurl api.grpc.me:443 list
+docker run ghcr.io/fullstorydev/grpcurl api.grpc.me:443 list
 ```
 Note that there are some pitfalls when using docker:
 - If you need to interact with a server listening on the host's loopback network, you must specify the host as `host.docker.internal` instead of `localhost` (for Mac or Windows) _OR_ have the container use the host network with `-network="host"` (Linux only).
@@ -78,6 +79,12 @@ of environments, including Windows and myriad Linux distributions.
 
 You can see more details and the full list of other packages for `grpcurl` at _repology.org_:
 https://repology.org/project/grpcurl/information
+
+### Snap
+
+You can install `grpcurl` using the snap package:
+
+`snap install grpcurl`
 
 ### From Source
 If you already have the [Go SDK](https://golang.org/doc/install) installed, you can use the `go`
@@ -139,12 +146,19 @@ grpcurl -d @ grpc.server.com:443 my.custom.server.Service/Method <<EOM
 {
   "id": 1234,
   "tags": [
-    "foor",
+    "foo",
     "bar"
   ]
 }
 EOM
 ```
+### Adding Headers/Metadata to Request
+Adding of headers / metadata to a rpc request is possible via the `-H name:value` command line option. Multiple headers can be added in a similar fashion.
+Example :
+```shell
+grpcurl -H header1:value1 -H header2:value2 -d '{"id": 1234, "tags": ["foo","bar"]}' grpc.server.com:443 my.custom.server.Service/Method
+```
+For more usage guide, check out the help docs via `grpcurl -help`
 
 ### Listing Services
 To list all services exposed by a server, use the "list" verb. When using `.proto` source
@@ -159,6 +173,13 @@ grpcurl -protoset my-protos.bin list
 
 # Using proto sources
 grpcurl -import-path ../protos -proto my-stuff.proto list
+
+# Export proto files (use -proto-out-dir to specify the output directory)
+grpcurl -plaintext -proto-out-dir "out_protos" "localhost:8787" describe my.custom.server.Service
+
+# Export protoset file (use -protoset-out to specify the output file)
+grpcurl -plaintext -protoset-out "out.protoset" "localhost:8787" describe my.custom.server.Service
+
 ```
 
 The "list" verb also lets you see all methods in a particular service:
@@ -192,7 +213,7 @@ are needed to use them.
 
 ### Server Reflection
 
-Without any additional command-line flags, `grpcurl` will try to use [server reflection](https://github.com/grpc/grpc/blob/master/src/proto/grpc/reflection/v1alpha/reflection.proto).
+Without any additional command-line flags, `grpcurl` will try to use [server reflection](https://github.com/grpc/grpc/blob/master/src/proto/grpc/reflection/v1/reflection.proto).
 
 Examples for how to set up server reflection can be found [here](https://github.com/grpc/grpc/blob/master/doc/server-reflection.md#known-implementations).
 

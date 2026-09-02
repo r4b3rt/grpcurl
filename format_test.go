@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/golang/protobuf/jsonpb" //lint:ignore SA1019 we have to import this because it appears in exported API
-	"github.com/golang/protobuf/proto"  //lint:ignore SA1019 we have to import this because it appears in exported API
+	"github.com/golang/protobuf/jsonpb"
+	"github.com/golang/protobuf/proto"
 	"github.com/jhump/protoreflect/desc"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -128,7 +128,7 @@ func TestHandler(t *testing.T) {
 
 				verbose := verbosityLevel > 0
 
-				_, formatter, err := RequestParserAndFormatter(format, source, nil, FormatOptions{IncludeTextSeparator: !verbose})
+				_, formatter, err := RequestParserAndFormatter(format, source, bytes.NewReader(nil), FormatOptions{IncludeTextSeparator: !verbose})
 				if err != nil {
 					t.Errorf("Failed to create parser and formatter: %v", err)
 					continue

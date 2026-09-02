@@ -4,10 +4,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,9 +21,9 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/alts"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
-	reflectpb "google.golang.org/grpc/reflection/grpc_reflection_v1alpha"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/descriptorpb"
 
@@ -33,9 +35,9 @@ import (
 	"github.com/fullstorydev/grpcurl"
 )
 
-// To avoid confusion between program error codes and the gRPC resonse
+// To avoid confusion between program error codes and the gRPC response
 // status codes 'Cancelled' and 'Unknown', 1 and 2 respectively,
-// the response status codes emitted use an offest of 64
+// the response status codes emitted use an offset of 64
 const statusCodeOffset = 64
 
 const noVersion = "dev build <no version set>"
@@ -53,11 +55,14 @@ var (
 		Print usage instructions and exit.`))
 	printVersion = flags.Bool("version", false, prettify(`
 		Print version.`))
+
 	plaintext = flags.Bool("plaintext", false, prettify(`
 		Use plain-text HTTP/2 when connecting to server (no TLS).`))
 	insecure = flags.Bool("insecure", false, prettify(`
 		Skip server certificate and domain verification. (NOT SECURE!) Not
 		valid with -plaintext option.`))
+
+	// TLS Options
 	cacert = flags.String("cacert", "", prettify(`
 		File containing trusted root certificates for verifying the server.
 		Ignored if -insecure is specified.`))
@@ -67,6 +72,13 @@ var (
 	key = flags.String("key", "", prettify(`
 		File containing client private key, to present to the server. Not valid
 		with -plaintext option. Must also provide -cert option.`))
+
+	// ALTS Options
+	usealts = flags.Bool("alts", false, prettify(`
+		Use Application Layer Transport Security (ALTS) when connecting to server.`))
+	altsHandshakerServiceAddress = flags.String("alts-handshaker-service", "", prettify(`If set, this server will be used to do the ATLS handshaking.`))
+	altsTargetServiceAccounts    multiString
+
 	protoset      multiString
 	protoFiles    multiString
 	importPaths   multiString
@@ -87,7 +99,8 @@ var (
 		value of the ":authority" pseudo-header in the HTTP/2 protocol. When TLS
 		is used, this will also be used as the server name when verifying the
 		server's certificate. It defaults to the address that is provided in the
-		positional arguments.`))
+		positional arguments, or 'localhost' in the case of a unix domain
+		socket.`))
 	userAgent = flags.String("user-agent", "", prettify(`
 		If set, the specified value will be added to the User-Agent header set
 		by the grpc-go library.
@@ -123,9 +136,11 @@ var (
 		is received for this same period then the connection is closed and the
 		operation fails.`))
 	maxTime = flags.Float64("max-time", 0, prettify(`
-		The maximum total time the operation can take, in seconds. This is
-		useful for preventing batch jobs that use grpcurl from hanging due to
-		slow or bad network links or due to incorrect stream method usage.`))
+		The maximum total time the operation can take, in seconds. This sets a
+                timeout on the gRPC context, allowing both client and server to give up
+		after the deadline has past. This is useful for preventing batch jobs
+                that use grpcurl from hanging due to slow or bad network links or due
+		to incorrect stream method usage.`))
 	maxMsgSz = flags.Int("max-msg-sz", 0, prettify(`
 		The maximum encoded size of a response message, in bytes, that grpcurl
 		will accept. If not specified, defaults to 4,194,304 (4 megabytes).`))
@@ -138,12 +153,20 @@ var (
 		file if this option is given. When invoking an RPC and this option is
 		given, the method being invoked and its transitive dependencies will be
 		included in the output file.`))
+	protoOut = flags.String("proto-out-dir", "", prettify(`
+		The name of a directory where the generated .proto files will be written.
+		With the list and describe verbs, the listed or described elements and
+		their transitive dependencies will be written as .proto files in the
+		specified directory if this option is given. When invoking an RPC and
+		this option is given, the method being invoked and its transitive
+		dependencies will be included in the generated .proto files in the
+		output directory.`))
 	msgTemplate = flags.Bool("msg-template", false, prettify(`
 		When describing messages, show a template of input data.`))
 	verbose = flags.Bool("v", false, prettify(`
 		Enable verbose output.`))
 	veryVerbose = flags.Bool("vv", false, prettify(`
-		Enable very verbose output.`))
+		Enable very verbose output (includes timing data).`))
 	serverName = flags.String("servername", "", prettify(`
 		Override server name when validating TLS certificate. This flag is
 		ignored if -plaintext or -insecure is used.
@@ -200,6 +223,14 @@ func init() {
 		-use-reflection is used in combination with a -proto or -protoset flag,
 		the provided descriptor sources will be used in addition to server
 		reflection to resolve messages and extensions.`))
+	flags.Var(&altsTargetServiceAccounts, "alts-target-service-account", prettify(`
+		The full email address of the service account that the server is
+		expected to be using when ALTS is used. You can specify this option
+		multiple times to indicate multiple allowed service accounts. If the
+		server authenticates with a service account that is not one of the
+		expected accounts, the RPC will not be issued. If no such arguments are
+		provided, no check will be performed, and the RPC will be issued
+		regardless of the server's service account.`))
 }
 
 type multiString []string
@@ -256,6 +287,32 @@ func (cs compositeSource) AllExtensionsForType(typeName string) ([]*desc.FieldDe
 	return exts, nil
 }
 
+type timingData struct {
+	Title  string
+	Start  time.Time
+	Value  time.Duration
+	Parent *timingData
+	Sub    []*timingData
+}
+
+func (d *timingData) Child(title string) *timingData {
+	if d == nil {
+		return nil
+	}
+	child := &timingData{Title: title, Start: time.Now()}
+	d.Sub = append(d.Sub, child)
+	return child
+}
+
+func (d *timingData) Done() {
+	if d == nil {
+		return
+	}
+	if d.Value == 0 {
+		d.Value = time.Since(d.Start)
+	}
+}
+
 func main() {
 	flags.Usage = usage
 	flags.Parse(os.Args[1:])
@@ -267,6 +324,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "%s %s\n", filepath.Base(os.Args[0]), version)
 		os.Exit(0)
 	}
+
+	// default behavior is to use tls
+	usetls := !*plaintext && !*usealts
 
 	// Do extra validation on arguments and figure out what user asked us to do.
 	if *connectTimeout < 0 {
@@ -281,17 +341,26 @@ func main() {
 	if *maxMsgSz < 0 {
 		fail(nil, "The -max-msg-sz argument must not be negative.")
 	}
-	if *plaintext && *insecure {
-		fail(nil, "The -plaintext and -insecure arguments are mutually exclusive.")
+	if *plaintext && *usealts {
+		fail(nil, "The -plaintext and -alts arguments are mutually exclusive.")
 	}
-	if *plaintext && *cert != "" {
-		fail(nil, "The -plaintext and -cert arguments are mutually exclusive.")
+	if *insecure && !usetls {
+		fail(nil, "The -insecure argument can only be used with TLS.")
 	}
-	if *plaintext && *key != "" {
-		fail(nil, "The -plaintext and -key arguments are mutually exclusive.")
+	if *cert != "" && !usetls {
+		fail(nil, "The -cert argument can only be used with TLS.")
+	}
+	if *key != "" && !usetls {
+		fail(nil, "The -key argument can only be used with TLS.")
 	}
 	if (*key == "") != (*cert == "") {
 		fail(nil, "The -cert and -key arguments must be used together and both be present.")
+	}
+	if *altsHandshakerServiceAddress != "" && !*usealts {
+		fail(nil, "The -alts-handshaker-service argument must be used with the -alts argument.")
+	}
+	if len(altsTargetServiceAccounts) > 0 && !*usealts {
+		fail(nil, "The -alts-target-service-account argument must be used with the -alts argument.")
 	}
 	if *format != "json" && *format != "text" {
 		fail(nil, "The -format option must be 'json' or 'text'.")
@@ -329,8 +398,16 @@ func main() {
 	if *verbose {
 		verbosityLevel = 1
 	}
+
+	var rootTiming *timingData
 	if *veryVerbose {
 		verbosityLevel = 2
+
+		rootTiming = &timingData{Title: "Timing Data", Start: time.Now()}
+		defer func() {
+			rootTiming.Done()
+			dumpTiming(rootTiming, 0)
+		}()
 	}
 
 	var symbol string
@@ -382,22 +459,24 @@ func main() {
 
 	ctx := context.Background()
 	if *maxTime > 0 {
-		timeout := time.Duration(*maxTime * float64(time.Second))
+		timeout := floatSecondsToDuration(*maxTime)
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
 
 	dial := func() *grpc.ClientConn {
+		dialTiming := rootTiming.Child("Dial")
+		defer dialTiming.Done()
 		dialTime := 10 * time.Second
 		if *connectTimeout > 0 {
-			dialTime = time.Duration(*connectTimeout * float64(time.Second))
+			dialTime = floatSecondsToDuration(*connectTimeout)
 		}
 		ctx, cancel := context.WithTimeout(ctx, dialTime)
 		defer cancel()
 		var opts []grpc.DialOption
 		if *keepaliveTime > 0 {
-			timeout := time.Duration(*keepaliveTime * float64(time.Second))
+			timeout := floatSecondsToDuration(*keepaliveTime)
 			opts = append(opts, grpc.WithKeepaliveParams(keepalive.ClientParameters{
 				Time:    timeout,
 				Timeout: timeout,
@@ -406,8 +485,31 @@ func main() {
 		if *maxMsgSz > 0 {
 			opts = append(opts, grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(*maxMsgSz)))
 		}
+		if isUnixSocket != nil && isUnixSocket() && !strings.HasPrefix(target, "unix://") {
+			// prepend unix:// to the address if it's not already there
+			// this is to maintain backwards compatibility because the custom dialer is replaced by
+			// the default dialer in grpc-go.
+			// https://github.com/fullstorydev/grpcurl/pull/480
+			target = "unix://" + target
+		}
 		var creds credentials.TransportCredentials
-		if !*plaintext {
+		if *plaintext {
+			if *authority != "" {
+				opts = append(opts, grpc.WithAuthority(*authority))
+			}
+		} else if *usealts {
+			clientOptions := alts.DefaultClientOptions()
+			if len(altsTargetServiceAccounts) > 0 {
+				clientOptions.TargetServiceAccounts = altsTargetServiceAccounts
+			}
+			if *altsHandshakerServiceAddress != "" {
+				clientOptions.HandshakerServiceAddress = *altsHandshakerServiceAddress
+			}
+			creds = alts.NewClientCreds(clientOptions)
+		} else if usetls {
+			tlsTiming := dialTiming.Child("TLS Setup")
+			defer tlsTiming.Done()
+
 			tlsConf, err := grpcurl.ClientTLSConfig(*insecure, *cacert, *cert, *key)
 			if err != nil {
 				fail(err, "Failed to create TLS config")
@@ -440,8 +542,9 @@ func main() {
 			if overrideName != "" {
 				opts = append(opts, grpc.WithAuthority(overrideName))
 			}
-		} else if *authority != "" {
-			opts = append(opts, grpc.WithAuthority(*authority))
+			tlsTiming.Done()
+		} else {
+			panic("Should have defaulted to use TLS.")
 		}
 
 		grpcurlUA := "grpcurl/" + version
@@ -453,11 +556,9 @@ func main() {
 		}
 		opts = append(opts, grpc.WithUserAgent(grpcurlUA))
 
-		network := "tcp"
-		if isUnixSocket != nil && isUnixSocket() {
-			network = "unix"
-		}
-		cc, err := grpcurl.BlockingDial(ctx, network, target, creds, opts...)
+		blockingDialTiming := dialTiming.Child("BlockingDial")
+		defer blockingDialTiming.Done()
+		cc, err := grpcurl.BlockingDial(ctx, "", target, creds, opts...)
 		if err != nil {
 			fail(err, "Failed to dial target host %q", target)
 		}
@@ -508,7 +609,8 @@ func main() {
 		md := grpcurl.MetadataFromHeaders(append(addlHeaders, reflHeaders...))
 		refCtx := metadata.NewOutgoingContext(ctx, md)
 		cc = dial()
-		refClient = grpcreflect.NewClientV1Alpha(refCtx, reflectpb.NewServerReflectionClient(cc))
+		refClient = grpcreflect.NewClientAuto(refCtx, cc)
+		refClient.AllowMissingFileDescriptors()
 		reflSource := grpcurl.DescriptorSourceFromServer(ctx, refClient)
 		if fileSource != nil {
 			descSource = compositeSource{reflSource, fileSource}
@@ -553,6 +655,9 @@ func main() {
 			if err := writeProtoset(descSource, svcs...); err != nil {
 				fail(err, "Failed to write protoset to %s", *protosetOut)
 			}
+			if err := writeProtos(descSource, svcs...); err != nil {
+				fail(err, "Failed to write protos to %s", *protoOut)
+			}
 		} else {
 			methods, err := grpcurl.ListMethods(descSource, symbol)
 			if err != nil {
@@ -567,6 +672,9 @@ func main() {
 			}
 			if err := writeProtoset(descSource, symbol); err != nil {
 				fail(err, "Failed to write protoset to %s", *protosetOut)
+			}
+			if err := writeProtos(descSource, symbol); err != nil {
+				fail(err, "Failed to write protos to %s", *protoOut)
 			}
 		}
 
@@ -657,7 +765,7 @@ func main() {
 				// create a request to invoke an RPC
 				tmpl := grpcurl.MakeTemplate(dsc)
 				options := grpcurl.FormatOptions{EmitJSONDefaultFields: true}
-				_, formatter, err := grpcurl.RequestParserAndFormatter(grpcurl.Format(*format), descSource, nil, options)
+				_, formatter, err := grpcurl.RequestParserAndFormatter(grpcurl.Format(*format), descSource, bytes.NewReader(nil), options)
 				if err != nil {
 					fail(err, "Failed to construct formatter for %q", *format)
 				}
@@ -671,6 +779,9 @@ func main() {
 		}
 		if err := writeProtoset(descSource, symbols...); err != nil {
 			fail(err, "Failed to write protoset to %s", *protosetOut)
+		}
+		if err := writeProtos(descSource, symbol); err != nil {
+			fail(err, "Failed to write protos to %s", *protoOut)
 		}
 
 	} else {
@@ -704,7 +815,9 @@ func main() {
 			VerbosityLevel: verbosityLevel,
 		}
 
+		invokeTiming := rootTiming.Child("InvokeRPC")
 		err = grpcurl.InvokeRPC(ctx, descSource, cc, symbol, append(addlHeaders, rpcHeaders...), h, rf.Next)
+		invokeTiming.Done()
 		if err != nil {
 			if errStatus, ok := status.FromError(err); ok && *formatError {
 				h.Status = errStatus
@@ -732,6 +845,17 @@ func main() {
 			}
 			exit(statusCodeOffset + int(h.Status.Code()))
 		}
+	}
+}
+
+func dumpTiming(td *timingData, lvl int) {
+	var ind strings.Builder
+	for x := 0; x < lvl; x++ {
+		ind.WriteString("  ")
+	}
+	fmt.Printf("%s%s: %s\n", ind.String(), td.Title, td.Value)
+	for _, sd := range td.Sub {
+		dumpTiming(sd, lvl+1)
 	}
 }
 
@@ -782,7 +906,7 @@ func prettify(docString string) string {
 		j++
 	}
 
-	return strings.Join(parts[:j], "\n"+indent())
+	return strings.Join(parts[:j], "\n")
 }
 
 func warn(msg string, args ...interface{}) {
@@ -818,6 +942,13 @@ func writeProtoset(descSource grpcurl.DescriptorSource, symbols ...string) error
 	return grpcurl.WriteProtoset(f, descSource, symbols...)
 }
 
+func writeProtos(descSource grpcurl.DescriptorSource, symbols ...string) error {
+	if *protoOut == "" {
+		return nil
+	}
+	return grpcurl.WriteProtoFiles(*protoOut, descSource, symbols...)
+}
+
 type optionalBoolFlag struct {
 	set, val bool
 }
@@ -841,4 +972,13 @@ func (f *optionalBoolFlag) Set(s string) error {
 
 func (f *optionalBoolFlag) IsBoolFlag() bool {
 	return true
+}
+
+func floatSecondsToDuration(seconds float64) time.Duration {
+	durationFloat := seconds * float64(time.Second)
+	if durationFloat > math.MaxInt64 {
+		// Avoid overflow
+		return math.MaxInt64
+	}
+	return time.Duration(durationFloat)
 }

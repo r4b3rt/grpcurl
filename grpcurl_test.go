@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/jsonpb" //lint:ignore SA1019 we have to import this because it appears in exported API
-	"github.com/golang/protobuf/proto"  //lint:ignore SA1019 we have to import this because it appears in exported API
+	"github.com/golang/protobuf/jsonpb"
+	"github.com/golang/protobuf/proto"
 	"github.com/jhump/protoreflect/desc"
 	"github.com/jhump/protoreflect/grpcreflect"
 	"google.golang.org/grpc"
@@ -21,7 +21,6 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/reflection"
-	reflectpb "google.golang.org/grpc/reflection/grpc_reflection_v1alpha"
 	"google.golang.org/grpc/status"
 
 	. "github.com/fullstorydev/grpcurl"
@@ -75,14 +74,12 @@ func TestMain(m *testing.M) {
 	defer svrReflect.Stop()
 
 	// And a corresponding client
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if ccReflect, err = grpc.DialContext(ctx, fmt.Sprintf("127.0.0.1:%d", portReflect),
-		grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock()); err != nil {
+	if ccReflect, err = grpc.NewClient(fmt.Sprintf("passthrough:///127.0.0.1:%d", portReflect),
+		grpc.WithTransportCredentials(insecure.NewCredentials())); err != nil {
 		panic(err)
 	}
 	defer ccReflect.Close()
-	refClient := grpcreflect.NewClientV1Alpha(context.Background(), reflectpb.NewServerReflectionClient(ccReflect))
+	refClient := grpcreflect.NewClientAuto(context.Background(), ccReflect)
 	defer refClient.Reset()
 
 	sourceReflect = DescriptorSourceFromServer(context.Background(), refClient)
@@ -100,10 +97,8 @@ func TestMain(m *testing.M) {
 	defer svrProtoset.Stop()
 
 	// And a corresponding client
-	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if ccNoReflect, err = grpc.DialContext(ctx, fmt.Sprintf("127.0.0.1:%d", portProtoset),
-		grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock()); err != nil {
+	if ccNoReflect, err = grpc.NewClient(fmt.Sprintf("passthrough:///127.0.0.1:%d", portProtoset),
+		grpc.WithTransportCredentials(insecure.NewCredentials())); err != nil {
 		panic(err)
 	}
 	defer ccNoReflect.Close()
@@ -118,7 +113,7 @@ func TestMain(m *testing.M) {
 }
 
 func TestServerDoesNotSupportReflection(t *testing.T) {
-	refClient := grpcreflect.NewClientV1Alpha(context.Background(), reflectpb.NewServerReflectionClient(ccNoReflect))
+	refClient := grpcreflect.NewClientAuto(context.Background(), ccNoReflect)
 	defer refClient.Reset()
 
 	refSource := DescriptorSourceFromServer(context.Background(), refClient)
@@ -178,7 +173,7 @@ func doTestListServices(t *testing.T, source DescriptorSource, includeReflection
 	var expected []string
 	if includeReflection {
 		// when using server reflection, we see the TestService as well as the ServerReflection service
-		expected = []string{"grpc.reflection.v1alpha.ServerReflection", "testing.TestService"}
+		expected = []string{"grpc.reflection.v1.ServerReflection", "grpc.reflection.v1alpha.ServerReflection", "testing.TestService"}
 	} else {
 		// without reflection, we see all services defined in the same test.proto file, which is the
 		// TestService as well as UnimplementedService
@@ -216,11 +211,11 @@ func doTestListMethods(t *testing.T, source DescriptorSource, includeReflection 
 
 	if includeReflection {
 		// when using server reflection, we see the TestService as well as the ServerReflection service
-		names, err = ListMethods(source, "grpc.reflection.v1alpha.ServerReflection")
+		names, err = ListMethods(source, "grpc.reflection.v1.ServerReflection")
 		if err != nil {
 			t.Fatalf("failed to list methods for ServerReflection: %v", err)
 		}
-		expected = []string{"grpc.reflection.v1alpha.ServerReflection.ServerReflectionInfo"}
+		expected = []string{"grpc.reflection.v1.ServerReflection.ServerReflectionInfo"}
 	} else {
 		// without reflection, we see all services defined in the same test.proto file, which is the
 		// TestService as well as UnimplementedService
@@ -244,7 +239,7 @@ func doTestListMethods(t *testing.T, source DescriptorSource, includeReflection 
 func TestGetAllFiles(t *testing.T) {
 	expectedFiles := []string{"test.proto"}
 	expectedFilesWithReflection := []string{
-		"grpc/reflection/v1alpha/reflection.proto", "test.proto",
+		"grpc/reflection/v1/reflection.proto", "grpc/reflection/v1alpha/reflection.proto", "test.proto",
 	}
 
 	for _, ds := range descSources {

@@ -1,13 +1,12 @@
 package main
 
-//go:generate protoc --go_out=plugins=grpc:./ bank.proto support.proto
+//go:generate protoc --go_out=. --go-grpc_out=. bank.proto support.proto
 
 import (
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"os/signal"
@@ -130,7 +129,7 @@ type svr struct {
 }
 
 func (s *svr) load() error {
-	accts, err := ioutil.ReadFile(s.datafile)
+	accts, err := os.ReadFile(s.datafile)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -162,7 +161,7 @@ func (s *svr) flush() {
 
 	if b, err := json.Marshal(accounts); err != nil {
 		grpclog.Errorf("failed to save data to %q", s.datafile)
-	} else if err := ioutil.WriteFile(s.datafile, b, 0666); err != nil {
+	} else if err := os.WriteFile(s.datafile, b, 0666); err != nil {
 		grpclog.Errorf("failed to save data to %q", s.datafile)
 	}
 }

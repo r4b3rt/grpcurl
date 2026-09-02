@@ -11,8 +11,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/golang/protobuf/jsonpb" //lint:ignore SA1019 we have to import this because it appears in exported API
-	"github.com/golang/protobuf/proto"  //lint:ignore SA1019 we have to import this because it appears in exported API
+	"github.com/golang/protobuf/jsonpb"
+	"github.com/golang/protobuf/proto"
 	"github.com/jhump/protoreflect/desc"
 	"github.com/jhump/protoreflect/dynamic"
 	"google.golang.org/grpc/codes"
@@ -136,10 +136,25 @@ type Formatter func(proto.Message) (string, error)
 func NewJSONFormatter(emitDefaults bool, resolver jsonpb.AnyResolver) Formatter {
 	marshaler := jsonpb.Marshaler{
 		EmitDefaults: emitDefaults,
-		Indent:       "  ",
 		AnyResolver:  resolver,
 	}
-	return marshaler.MarshalToString
+	// Workaround for indentation issue in jsonpb with Any messages.
+	// Bug was originally fixed in https://github.com/golang/protobuf/pull/834
+	// but later re-introduced before the module was deprecated and frozen.
+	// If jsonpb is ever replaced with google.golang.org/protobuf/encoding/protojson
+	// this workaround will no longer be needed.
+	formatter := func(message proto.Message) (string, error) {
+		output, err := marshaler.MarshalToString(message)
+		if err != nil {
+			return "", err
+		}
+		var buf bytes.Buffer
+		if err := json.Indent(&buf, []byte(output), "", "  "); err != nil {
+			return "", err
+		}
+		return buf.String(), nil
+	}
+	return formatter
 }
 
 // NewTextFormatter returns a formatter that returns strings in the protobuf
@@ -274,11 +289,11 @@ func (r *anyResolver) Resolve(typeUrl string) (proto.Message, error) {
 	if !ok {
 		return nil, fmt.Errorf("unknown message: %s", typeUrl)
 	}
-	// populate any extensions for this message, too
-	if exts, err := r.source.AllExtensionsForType(mname); err != nil {
-		return nil, err
-	} else if err := r.er.AddExtension(exts...); err != nil {
-		return nil, err
+	// populate any extensions for this message, too (if there are any)
+	if exts, err := r.source.AllExtensionsForType(mname); err == nil {
+		if err := r.er.AddExtension(exts...); err != nil {
+			return nil, err
+		}
 	}
 
 	if r.mf == nil {
@@ -315,7 +330,6 @@ func (r anyResolverWithFallback) Resolve(typeUrl string) (proto.Message, error) 
 	if slash := strings.LastIndex(mname, "/"); slash >= 0 {
 		mname = mname[slash+1:]
 	}
-	//lint:ignore SA1019 new non-deprecated API requires other code changes; deferring...
 	mt := proto.MessageType(mname)
 	if mt != nil {
 		return reflect.New(mt.Elem()).Interface().(proto.Message), nil
